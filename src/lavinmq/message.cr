@@ -69,6 +69,8 @@ module LavinMQ
   struct Message
     property timestamp
     getter exchange_name, routing_key, properties, bodysize, body_io
+    # Set when the vhost's Tracer is on, to follow the message through the broker
+    property trace_id = 0_u64
 
     def initialize(@timestamp : Int64, @exchange_name : String,
                    @routing_key : String, @properties : AMQ::Protocol::Properties,

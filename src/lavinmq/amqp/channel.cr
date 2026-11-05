@@ -244,12 +244,16 @@ module LavinMQ
 
       private def publish_and_return(msg)
         validate_user_id(msg.properties.user_id)
+        if (tracer = @client.vhost.tracer).enabled?
+          msg.trace_id = tracer.publish(msg.exchange_name, msg.routing_key, msg.body_io, msg.bodysize,
+            @client.client_name, @name)
+        end
         if @tx
           @tx_publishes.push TxMessage.new(msg, @next_publish_mandatory, @next_publish_immediate)
           return
         end
 
-        confirm do
+        confirm(msg.trace_id) do
           ok = @client.vhost.publish msg, @next_publish_immediate, @visited, @found_queues
           basic_return(msg, @next_publish_mandatory, @next_publish_immediate) unless ok
         rescue e : LavinMQ::Error::PreconditionFailed
@@ -270,14 +274,17 @@ module LavinMQ
         end
       end
 
-      private def confirm(&)
+      # `trace_id` is the message's id in the vhost's Tracer, 0 when not tracing
+      private def confirm(trace_id = 0_u64, &)
         if @confirm
           msgid = @confirm_total &+= 1
           begin
             yield
             confirm_ack(msgid)
+            @client.vhost.tracer.confirm(trace_id, @client.client_name, true) unless trace_id.zero?
           rescue ex
             confirm_nack(msgid)
+            @client.vhost.tracer.confirm(trace_id, @client.client_name, false) unless trace_id.zero?
             raise ex
           end
         else
@@ -316,6 +323,11 @@ module LavinMQ
 
       private def basic_return(msg : Message, mandatory : Bool, immediate : Bool)
         @return_unroutable_count.add(1, :relaxed)
+        unless msg.trace_id.zero?
+          if immediate || mandatory
+            @client.vhost.tracer.returned(msg.trace_id, @client.client_name, immediate ? "NO_CONSUMERS" : "NO_ROUTE")
+          end
+        end
         if immediate
           retrn = AMQP::Frame::Basic::Return.new(@id, 313_u16, "NO_CONSUMERS", msg.exchange_name, msg.routing_key)
           deliver(retrn, msg)
@@ -412,6 +424,9 @@ module LavinMQ
             @deliver_get_count.add(1, :relaxed)
             ok = q.basic_get(frame.no_ack) do |env|
               delivery_tag = next_delivery_tag(q, env.segment_position, frame.no_ack, nil)
+              if (tracer = @client.vhost.tracer).enabled?
+                tracer.deliver(q.name, env.segment_position, "basic.get", @name, delivery_tag, env.redelivered, frame.no_ack)
+              end
               unless frame.no_ack # track unacked messages
                 q.basic_get_unacked << UnackedMessage.new(self, delivery_tag, RoughTime.monotonic)
               end
@@ -486,6 +501,7 @@ module LavinMQ
           return
         end
 
+        wait_for_step("ack", frame.delivery_tag, frame.multiple) if @client.vhost.tracer.stepping?
         found = false
         if frame.multiple
           found = true if frame.delivery_tag.zero?
@@ -505,6 +521,9 @@ module LavinMQ
       end
 
       private def do_ack(unack)
+        if (tracer = @client.vhost.tracer).enabled?
+          tracer.ack(unack.queue.name, unack.sp, unack.consumer.try(&.tag) || "basic.get", unack.tag)
+        end
         if c = unack.consumer
           c.ack(unack.sp)
         end
@@ -528,6 +547,7 @@ module LavinMQ
         end
 
         @log.debug { "Rejecting #{frame.inspect}" }
+        wait_for_step("reject", frame.delivery_tag, false) if @client.vhost.tracer.stepping?
         if unack = delete_unacked(frame.delivery_tag)
           do_reject(frame.requeue, unack)
         else
@@ -553,15 +573,16 @@ module LavinMQ
           return
         end
 
+        wait_for_step("reject", frame.delivery_tag, frame.multiple) if @client.vhost.tracer.stepping?
         found = false
         if frame.multiple
           delete_multiple_unacked(frame.delivery_tag) do |unack|
             found = true
-            do_reject(frame.requeue, unack)
+            do_reject(frame.requeue, unack, nack: true)
           end
         elsif unack = delete_unacked(frame.delivery_tag)
           found = true
-          do_reject(frame.requeue, unack)
+          do_reject(frame.requeue, unack, nack: true)
         end
         unless found
           @client.send_precondition_failed(frame, unknown_tag(frame.delivery_tag))
@@ -583,7 +604,29 @@ module LavinMQ
         "unknown delivery tag #{delivery_tag}"
       end
 
-      private def do_reject(requeue, unack)
+      # In the tracer's step mode, a consumer's ack or reject waits here until it
+      # is let through, one step per message that it settles
+      private def wait_for_step(stage : String, delivery_tag : UInt64, multiple : Bool) : Nil
+        tracer = @client.vhost.tracer
+        settled = @unack_lock.synchronize do
+          if multiple
+            @unacked.select { |u| delivery_tag.zero? || u.tag <= delivery_tag }
+          else
+            @unacked.select { |u| u.tag == delivery_tag }
+          end
+        end
+        settled.each do |u|
+          tracer.gate(stage, tracer.id_for(u.queue.name, u.sp), u.queue.name) do |json|
+            json.field "consumer", u.consumer.try(&.tag) || "basic.get"
+            json.field "delivery_tag", u.tag
+          end
+        end
+      end
+
+      private def do_reject(requeue, unack, nack = false)
+        if (tracer = @client.vhost.tracer).enabled?
+          tracer.reject(unack.queue.name, unack.sp, unack.consumer.try(&.tag) || "basic.get", unack.tag, requeue, nack)
+        end
         if c = unack.consumer
           c.reject(unack.sp, requeue)
         end

@@ -42,7 +42,8 @@ module LavinMQ::AMQP
         # It's done like this to be able to dead letter to all destinations
         # except to the queue itself if a cycle is detected.
         # This is also how it's done in rabbitmq
-        def route(msg : BytesMessage, reason) # ameba:disable Metrics/CyclomaticComplexity
+        # `trace_id` is the message's id in the vhost's Tracer, 0 when not tracing
+        def route(msg : BytesMessage, reason, trace_id : UInt64 = 0_u64) # ameba:disable Metrics/CyclomaticComplexity
           # No dead letter exchange => nothing to do
           return unless dlx = (msg.dlx || dlx())
           ex = @vhost.exchanges[dlx.to_s]? || return
@@ -67,15 +68,23 @@ module LavinMQ::AMQP
           # cycle detection and to not create a lot of faulty stats.
           # This means that no delay, consistent hash check or such is performed
           # if the dead letter exchange has any of these features enabled.
+          copy_id = 0_u64
+          unless trace_id.zero?
+            copy_id = @vhost.tracer.dead_letter(trace_id, @queue_name, dlx.to_s, routing_rk, reason.to_s)
+          end
           queues = Set(LavinMQ::Queue).new
-          ex.find_queues(routing_rk, routing_headers, queues)
-          return if queues.empty?
+          ex.find_queues(routing_rk, routing_headers, queues, trace_id: copy_id)
+          if queues.empty?
+            @vhost.tracer.unrouted(copy_id, dlx.to_s) unless copy_id.zero?
+            return
+          end
 
           is_cycle = cycle?(props, reason)
 
           dead_lettered_msg = Message.new(
             RoughTime.unix_ms, dlx.to_s, routing_rk.to_s,
             props, msg.bodysize, IO::Memory.new(msg.body))
+          dead_lettered_msg.trace_id = copy_id
 
           queues.each do |q|
             next if is_cycle && q.name == @queue_name

@@ -80,6 +80,7 @@ module LavinMQ
             @log.debug { "Getting a new message" }
           {% end %}
           queue.consume_get(@no_ack) do |env|
+            wait_for_step(env.segment_position) if queue.vhost.tracer.stepping?
             deliver(env.message, env.segment_position, env.redelivered)
             delivered_bytes &+= env.message.bytesize
             @channel.increment_deliver_count(env.redelivered, @no_ack)
@@ -91,6 +92,20 @@ module LavinMQ
         end
       rescue ex : ClosedError | Queue::ClosedError | AMQP::Channel::ClosedError | ::Channel::ClosedError | IO::Error
         @log.debug { "deliver loop exiting: #{ex.inspect}" }
+      end
+
+      # In the tracer's step mode, the message waits here until it is let through.
+      # If the consumer goes away meanwhile, the message goes back to the queue.
+      private def wait_for_step(sp : SegmentPosition) : Nil
+        tracer = @queue.vhost.tracer
+        id = tracer.id_for(@queue.name, sp)
+        tracer.gate("deliver", id, @queue.name, @notify_closed) do |json|
+          json.field "consumer", @tag
+        end
+        raise ClosedError.new if @closed
+      rescue ex : ClosedError | ::Channel::ClosedError
+        @queue.reject(sp, requeue: true) unless @no_ack # with no_ack, the queue requeues it itself
+        raise ClosedError.new
       end
 
       private def wait_for_global_capacity
@@ -209,6 +224,9 @@ module LavinMQ
           @has_capacity.set(false) if (unacked + 1) == @prefetch_count
         end
         delivery_tag = @channel.next_delivery_tag(@queue, sp, @no_ack, self)
+        if (tracer = @queue.vhost.tracer).enabled?
+          tracer.deliver(@queue.name, sp, @tag, @channel.name, delivery_tag, redelivered, @no_ack)
+        end
         deliver = AMQP::Frame::Basic::Deliver.new(@channel.id, @tag,
           delivery_tag,
           redelivered,

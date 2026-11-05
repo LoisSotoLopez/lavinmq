@@ -15,6 +15,7 @@ require "./event_type"
 require "./stats"
 require "./queue_factory"
 require "./mqtt/session"
+require "./tracer"
 
 module LavinMQ
   class VHost
@@ -38,6 +39,8 @@ module LavinMQ
     @shovels : ShovelStore?
     @upstreams : Federation::UpstreamStore?
     @connections = Array(Client).new(512)
+    # Records where messages go, for the simulator. Off unless turned on through the HTTP API.
+    getter tracer : Tracer
     @definitions_file : File
     @definitions_lock = Mutex.new(:reentrant)
     @definitions_file_path : String
@@ -46,6 +49,7 @@ module LavinMQ
 
     def initialize(@name : String, @server_data_dir : String, @users : Auth::UserStore, @replicator : Clustering::Replicator?, @description = "", @tags = Array(String).new(0))
       @log = Logger.new(Log, vhost: @name)
+      @tracer = Tracer.new(@name)
       @dir = Digest::SHA1.hexdigest(@name)
       @data_dir = File.join(@server_data_dir, @dir)
       Dir.mkdir_p File.join(@data_dir)
@@ -126,6 +130,15 @@ module LavinMQ
     def publish(msg : Message, immediate = false,
                 visited = Set(LavinMQ::Exchange).new, found_queues = Set(LavinMQ::Queue).new) : Bool
       ex = @exchanges[msg.exchange_name]? || return false
+      tracer = @tracer
+      if tracer.enabled?
+        if msg.trace_id.zero?
+          msg.trace_id = tracer.publish(msg.exchange_name, msg.routing_key, msg.body_io, msg.bodysize, nil, nil)
+        end
+        tracer.gate("publish", msg.trace_id, msg.exchange_name) do |json|
+          json.field "routing_key", msg.routing_key
+        end
+      end
       ex.publish(msg, immediate, found_queues, visited)
     ensure
       visited.clear

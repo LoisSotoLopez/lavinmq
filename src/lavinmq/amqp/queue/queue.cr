@@ -517,9 +517,10 @@ module LavinMQ::AMQP
         d.add(msg)
       end
       reject_on_overflow(msg)
-      @msg_store_lock.synchronize do
+      sp = @msg_store_lock.synchronize do
         @msg_store.push(msg)
       end
+      @vhost.tracer.enqueue(msg.trace_id, @name, sp) unless msg.trace_id.zero?
       @publish_count.add(1, :relaxed)
       drop_overflow_if_no_immediate_delivery
       true
@@ -534,6 +535,7 @@ module LavinMQ::AMQP
       if ml = @max_length
         if @msg_store.size >= ml
           @log.debug { "Overflow reject message msg=#{msg}" }
+          @vhost.tracer.reject_publish(msg.trace_id, @name) unless msg.trace_id.zero?
           raise RejectOverFlow.new
         end
       end
@@ -541,6 +543,7 @@ module LavinMQ::AMQP
       if mlb = @max_length_bytes
         if @msg_store.bytesize + msg.bytesize >= mlb
           @log.debug { " Overflow reject message msg=#{msg}" }
+          @vhost.tracer.reject_publish(msg.trace_id, @name) unless msg.trace_id.zero?
           raise RejectOverFlow.new
         end
       end
@@ -670,6 +673,7 @@ module LavinMQ::AMQP
         env = Envelope.new(sp, msg, false)
         expire_msg(env, reason)
       else
+        @vhost.tracer.drop(@name, sp, reason.to_s, nil) if @vhost.tracer.enabled?
         delete_message sp
       end
     end
@@ -679,7 +683,11 @@ module LavinMQ::AMQP
       msg = env.message
       @log.debug { "Expiring #{sp} now due to #{reason}" }
 
-      @dead_letter.route(msg, reason)
+      trace_id = 0_u64
+      if @vhost.tracer.enabled?
+        trace_id = @vhost.tracer.drop(@name, sp, reason.to_s, msg.dlx || @dead_letter.dlx)
+      end
+      @dead_letter.route(msg, reason, trace_id)
 
       delete_message sp
     end
@@ -814,6 +822,7 @@ module LavinMQ::AMQP
           @msg_store_lock.synchronize do
             @msg_store.requeue(sp)
           end
+          @vhost.tracer.requeue(@name, sp) if @vhost.tracer.enabled?
           drop_overflow_if_no_immediate_delivery
         end
       else

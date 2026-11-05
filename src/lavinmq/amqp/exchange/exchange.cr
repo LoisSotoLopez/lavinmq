@@ -231,14 +231,17 @@ module LavinMQ
 
       private def route_msg(msg : Message, immediate : Bool, queues : Set(LavinMQ::Queue), exchanges : Set(LavinMQ::Exchange)) : Bool
         headers = msg.properties.headers
-        find_queues(msg.routing_key, headers, queues, exchanges)
+        trace_id = msg.trace_id
+        find_queues(msg.routing_key, headers, queues, exchanges, trace_id)
         if queues.empty? || (immediate && !queues.any? &.immediate_delivery?)
           @unroutable_count.add(1, :relaxed)
+          @vhost.tracer.unrouted(trace_id, @name) unless trace_id.zero?
           return false
         end
 
         count = 0u32
         queues.each do |queue|
+          @vhost.tracer.gate("enqueue", trace_id, queue.name) unless trace_id.zero?
           if queue.publish(msg)
             count += 1
             msg.body_io.seek(-msg.bodysize.to_i64, IO::Seek::Current) # rewind
@@ -249,9 +252,12 @@ module LavinMQ
         count.positive?
       end
 
+      # `trace_id` is the id the vhost's Tracer gave the message (0 when not tracing):
+      # with one, every hop is recorded
       def find_queues(routing_key : String, headers : AMQP::Table?,
                       queues : Set(LavinMQ::Queue) = Set(LavinMQ::Queue).new,
-                      exchanges : Set(LavinMQ::Exchange) = Set(LavinMQ::Exchange).new) : Nil
+                      exchanges : Set(LavinMQ::Exchange) = Set(LavinMQ::Exchange).new,
+                      trace_id : UInt64 = 0_u64) : Nil
         return unless exchanges.add? self
         each_destination(routing_key, headers) do |d|
           case d
@@ -259,25 +265,32 @@ module LavinMQ
             # Prevent routing to own internal delayed queue to avoid infinite loops
             unless delayed? && d == @delayed_queue
               queues.add(d)
+              trace_route(trace_id, d.name, "queue", @name.empty? ? "default" : "binding") unless trace_id.zero?
             end
           in LavinMQ::Exchange
-            d.find_queues(routing_key, headers, queues, exchanges)
+            trace_route(trace_id, d.name, "exchange", "binding") unless trace_id.zero?
+            d.find_queues(routing_key, headers, queues, exchanges, trace_id)
           end
         end
 
         if hdrs = headers
-          find_cc_queues(hdrs, "CC", queues)
-          find_cc_queues(hdrs, "BCC", queues)
+          find_cc_queues(hdrs, "CC", queues, trace_id)
+          find_cc_queues(hdrs, "BCC", queues, trace_id)
         end
 
         if queues.empty? && alternate_exchange
           @vhost.exchanges[alternate_exchange]?.try do |ae|
-            ae.find_queues(routing_key, headers, queues, exchanges)
+            trace_route(trace_id, ae.name, "exchange", "alternate") unless trace_id.zero?
+            ae.find_queues(routing_key, headers, queues, exchanges, trace_id)
           end
         end
       end
 
-      private def find_cc_queues(headers, key, queues)
+      private def trace_route(trace_id : UInt64, to : String, to_kind : String, via : String) : Nil
+        @vhost.tracer.route(trace_id, @name, to, to_kind, via)
+      end
+
+      private def find_cc_queues(headers, key, queues, trace_id = 0_u64)
         return unless cc = headers[key]?
         cc = cc.as?(Array(AMQP::Field))
 
@@ -288,7 +301,7 @@ module LavinMQ
         hdrs.delete key
         cc.each do |rk|
           if rk = rk.as?(String)
-            find_queues(rk, hdrs, queues)
+            find_queues(rk, hdrs, queues, trace_id: trace_id)
           else
             raise LavinMQ::Error::PreconditionFailed.new("#{key} header not a string array")
           end
